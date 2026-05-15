@@ -137,7 +137,10 @@ class AstroFarmMain:
         self.stop_event = Event()
         self.last_exg_mean = 0.0
 
-        self.sensor_mgr = SensorManager(period_sec=min(5.0, self.loop_sec))
+        self.sensor_mgr = SensorManager(
+            period_sec=min(5.0, self.loop_sec),
+            dht_bcm_pin=args.dht_bcm,
+        )
         self.temp_ctrl = TemperatureController(
             kp=args.kp,
             ki=args.ki,
@@ -327,6 +330,13 @@ def parse_args():
     parser.add_argument("--meta", type=str, default="models/lstm_meta.json")
     parser.add_argument("--capture-dir", type=str, default="captures")
     parser.add_argument("--log-dir", type=str, default="logs")
+    parser.add_argument(
+        "--dht-bcm",
+        type=int,
+        default=None,
+        metavar="N",
+        help="DHT11 BCM GPIO 번호 (예: 17). 생략 시 ASTROFARM_DHT_BCM 환경변수 또는 기본 17",
+    )
     parser.add_argument(
         "--loop-sec",
         type=float,

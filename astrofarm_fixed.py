@@ -4,7 +4,7 @@ AstroFarm - 달 기지 스마트팜 통합 제어 시스템 + 테스트/시뮬�
 Raspberry Pi Zero 2W OBC
 
 하드웨어 구성:
-  DHT11        : 온습도 센서               (1-Wire, GPIO 4)
+  DHT11        : 온습도 센서               (BCM GPIO 기본 17 — 환경변수 ASTROFARM_DHT_BCM)
   RX-9 Simple  : CO2 센서 (전기화학식)     (Analog EMF  -> ADS1015 CH2)
                   내장 서미스터(NTC)        (Analog      -> ADS1015 CH3)
   AS7262       : 6채널 분광 센서           (I2C, 0x49)
@@ -94,6 +94,21 @@ if not HARDWARE and _HARDWARE_IMPORT_ERROR is not None:
         "HARDWARE=False (실장 라이브러리 Import 실패): %s — 시뮬레이션 모드",
         _HARDWARE_IMPORT_ERROR,
     )
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("%s=%r 무시 (정수 아님), 기본 %s 사용", name, raw, default)
+        return default
+
+
+# DHT11 데이터선 BCM 번호(물리 핀 번호 아님). 기본 17. 변경 예: export ASTROFARM_DHT_BCM=4
+DHT11_BCM_PIN = _env_int("ASTROFARM_DHT_BCM", 17)
 
 # =========================================================================
 #  데이터 클래스
@@ -228,22 +243,35 @@ class PIDController:
         self._prev_time = time.time()
 
 # =========================================================================
-#  DHT11 온습도 센서 (1-Wire, GPIO 4)
+#  DHT11 온습도 센서 (BCM GPIO, 기본 17 — ASTROFARM_DHT_BCM 으로 변경)
 # =========================================================================
 
 class DHT11Sensor:
     """
     DHT11 온습도 센서
     범위: 온도 0~50 C (+-2 C), 습도 20~90 %RH (+-5 %)
+    핀: Blinka `board.D{n}` (n = BCM 번호). 기본은 모듈 상수 DHT11_BCM_PIN.
     """
 
-    def __init__(self):
+    def __init__(self, bcm_pin: Optional[int] = None):
+        self._bcm = int(DHT11_BCM_PIN if bcm_pin is None else bcm_pin)
         self._device = None
         if HARDWARE:
-            self._device = adafruit_dht.DHT11(board.D4, use_pulseio=False)
-            log.info("DHT11 초기화 완료 (GPIO 4)")
+            pin_name = f"D{self._bcm}"
+            if not hasattr(board, pin_name):
+                raise RuntimeError(
+                    f"DHT11: 이 보드에 board.{pin_name}(BCM GPIO{self._bcm}) 가 없습니다."
+                )
+            pin = getattr(board, pin_name)
+            self._device = adafruit_dht.DHT11(pin, use_pulseio=False)
+            log.info("DHT11 초기화 완료 (BCM GPIO %s)", self._bcm)
         else:
             log.info("[SIM] DHT11 시뮬레이션 모드")
+
+    @property
+    def bcm_pin(self) -> int:
+        """사용 중인 BCM GPIO 번호."""
+        return self._bcm
 
     def read(self) -> tuple:
         if not HARDWARE:
@@ -1402,7 +1430,7 @@ class PhotoperiodScheduler:
 class SensorManager:
     """
     요구사항 기반 통합 센서 매니저
-      - DHT11(GPIO4): temp_air, humidity
+      - DHT11(BCM GPIO, 기본 17 / ASTROFARM_DHT_BCM): temp_air, humidity
       - AS7262(I2C): par_450~par_650
       - ADS1015(I2C): A0=EC, A1=pH, A2=RX-9 CO2, A3=NTSF-4 water_temp
       - AS7262/ADS1015는 ThreadPoolExecutor로 병렬 읽기
@@ -1413,14 +1441,18 @@ class SensorManager:
     RX9_EMF_ZERO_MV = 300.0
     RX9_SLOPE = 55.0
 
-    def __init__(self, period_sec: float = READ_PERIOD_SEC):
+    def __init__(
+        self,
+        period_sec: float = READ_PERIOD_SEC,
+        dht_bcm_pin: Optional[int] = None,
+    ):
         self.period_sec = max(0.1, float(period_sec))
         self._last_read = 0.0
 
         self._i2c = None
         self._executor = ThreadPoolExecutor(max_workers=2)
 
-        self._dht = DHT11Sensor()
+        self._dht = DHT11Sensor(bcm_pin=dht_bcm_pin)
         self._spectral = None
 
         # ADS1015 채널 매핑 (요구사항 고정)
@@ -1563,10 +1595,11 @@ class SensorManager:
             return out
 
     def probe_dht11(self) -> Dict[str, Any]:
-        """GPIO4 DHT11 단독 읽기 (배선·라이브러리 점검용)."""
+        """DHT11 단독 읽기 (배선·라이브러리 점검용). BCM 핀은 DHT11_BCM_PIN."""
         out = dict(self._read_dht11())
         out["_probe"] = "DHT11"
         out["_hardware"] = HARDWARE
+        out["dht_bcm"] = self._dht.bcm_pin
         return out
 
     def probe_as7262(self) -> Dict[str, Any]:

@@ -4,6 +4,9 @@
 사용 예:
   python3 sensor_test.py              # 대화형 메뉴
   python3 sensor_test.py dht11
+  python3 sensor_test.py dht11                      # 기본 BCM GPIO17
+  python3 sensor_test.py --dht-bcm 4 dht11         # BCM GPIO4로 바꿀 때
+  ASTROFARM_DHT_BCM=22 python3 sensor_test.py dht11
   python3 sensor_test.py as7262
   python3 sensor_test.py ads1015
   python3 sensor_test.py all
@@ -14,10 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any, Dict
-
-from astrofarm_fixed import HARDWARE, MockSensorManager, SensorManager
 
 
 def _print_block(title: str, data: Dict[str, Any]) -> None:
@@ -52,6 +54,8 @@ def _mock_slice(full: Dict[str, Any], sensor: str) -> Dict[str, Any]:
 
 
 def run_probe(sensor: str, *, use_mock: bool) -> None:
+    from astrofarm_fixed import HARDWARE, MockSensorManager, SensorManager
+
     if use_mock:
         mgr = MockSensorManager()
         full = mgr.read_once()
@@ -79,9 +83,11 @@ def run_probe(sensor: str, *, use_mock: bool) -> None:
 
 
 def _menu() -> None:
+    from astrofarm_fixed import DHT11_BCM_PIN, HARDWARE
+
     print(
         "센서 단독 테스트 — 번호 선택 후 Enter (종료: q)\n"
-        "  1 : DHT11 (GPIO4)\n"
+        f"  1 : DHT11 (BCM GPIO{DHT11_BCM_PIN})\n"
         "  2 : AS7262 (I2C 0x49)\n"
         "  3 : ADS1015 (I2C 0x48, A0~A3)\n"
         "  4 : 위 세 가지 연속\n"
@@ -114,6 +120,13 @@ def _menu() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="센서 단독 읽기 테스트")
     parser.add_argument(
+        "--dht-bcm",
+        type=int,
+        default=None,
+        metavar="N",
+        help="DHT11 BCM GPIO 번호 (미지정 시 환경변수 ASTROFARM_DHT_BCM 또는 기본 17)",
+    )
+    parser.add_argument(
         "sensor",
         nargs="?",
         choices=("dht11", "as7262", "ads1015", "all"),
@@ -125,6 +138,9 @@ def main() -> int:
         help="MockSensorManager로 시뮬 값만 출력",
     )
     args = parser.parse_args()
+
+    if args.dht_bcm is not None:
+        os.environ["ASTROFARM_DHT_BCM"] = str(args.dht_bcm)
 
     if args.sensor is None:
         _menu()
