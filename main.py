@@ -5,7 +5,7 @@ AstroFarm 통합 실행 엔트리포인트
   SensorManager -> TemperatureController -> LSTMInference -> ExGAnalyzer -> XBeeComm
 
 특징:
-  - 60초 주기 메인 루프
+  - 5초 주기 메인 루프
   - 모듈 단위 장애 격리(실패 모듈만 스킵, 루프 지속)
   - 날짜별 CSV 로컬 저장
   - systemd 운용을 위한 SIGTERM/SIGINT 핸들링
@@ -128,7 +128,7 @@ class DailyCSVLogger:
 
 
 class AstroFarmMain:
-    LOOP_SEC = 60.0
+    LOOP_SEC = 5.0
 
     def __init__(self, args):
         self.args = args
@@ -174,7 +174,7 @@ class AstroFarmMain:
         return out
 
     def run(self):
-        log.info("AstroFarmMain 시작 (loop=60s)")
+        log.info("AstroFarmMain 시작 (loop=%gs)", self.LOOP_SEC)
         while not self.stop_event.is_set():
             t0 = time.time()
             timestamp = datetime.now().isoformat()

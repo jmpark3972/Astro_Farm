@@ -17,7 +17,7 @@
 - `infer_tflite_pi.py`
   - Pi Zero용 TFLite 추론
 - `main.py`
-  - 통합 실행 루프(60초 주기)
+  - 통합 실행 루프(5초 주기)
 
 ## 실행 순서 (main.py)
 
