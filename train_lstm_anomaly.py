@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import glob
 import json
 import os
 from typing import Dict, List, Tuple
@@ -23,29 +24,106 @@ import tensorflow as tf
 
 FEATURE_NAMES = ["temperature", "humidity", "co2", "ec", "ph", "par", "exg"]
 
+# main.py CSV 의 PAR 채널 → astrofarm_fixed.PAR_WEIGHTS 와 동일 가중치
+CSV_PAR_BAND_WEIGHTS: Tuple[Tuple[str, float], ...] = (
+    ("sensor_par_450", 0.10),
+    ("sensor_par_500", 0.15),
+    ("sensor_par_550", 0.20),
+    ("sensor_par_570", 0.20),
+    ("sensor_par_600", 0.15),
+    ("sensor_par_650", 0.20),
+)
+
 
 def _safe_float(v, default=np.nan) -> float:
     try:
         if v is None:
+            return float(default)
+        if isinstance(v, str) and not str(v).strip():
             return float(default)
         return float(v)
     except (TypeError, ValueError):
         return float(default)
 
 
+def _pick(row: Dict, *keys: str):
+    """CSV/JSON 행에서 첫 번째 비어 있지 않은 값 선택 (0.0도 유효)."""
+    for k in keys:
+        if k not in row:
+            continue
+        v = row[k]
+        if v is None:
+            continue
+        if isinstance(v, str) and not str(v).strip():
+            continue
+        return v
+    return None
+
+
+def _weighted_par_from_main_csv(row: Dict) -> float:
+    total_w = 0.0
+    acc = 0.0
+    for key, w in CSV_PAR_BAND_WEIGHTS:
+        val = _safe_float(_pick(row, key))
+        if not np.isnan(val):
+            acc += val * w
+            total_w += w
+    if total_w <= 0:
+        return float(np.nan)
+    return float(acc / total_w)
+
+
 def extract_feature_vector(row: Dict) -> np.ndarray:
     """
-    로거/SensorManager 두 포맷을 모두 허용하여 7개 특징 벡터 추출.
+    로거/SensorManager/main.py CSV 포맷을 허용하여 7개 특징 벡터 추출.
     """
-    temperature = _safe_float(row.get("temperature", row.get("temp_air")))
-    humidity = _safe_float(row.get("humidity"))
-    co2 = _safe_float(row.get("co2_ppm", row.get("co2")))
-    ec = _safe_float(row.get("ec_ms_cm", row.get("ec")))
-    ph = _safe_float(row.get("ph"))
-    par = _safe_float(row.get("par_ue", row.get("par")))
-    exg = _safe_float(row.get("exg_mean", row.get("exg")))
+    temperature = _safe_float(_pick(row, "temperature", "temp_air", "sensor_temp_air"))
+    humidity = _safe_float(_pick(row, "humidity", "sensor_humidity"))
+    co2 = _safe_float(_pick(row, "co2_ppm", "co2", "sensor_co2"))
+    ec = _safe_float(_pick(row, "ec_ms_cm", "ec", "sensor_ec"))
+    ph = _safe_float(_pick(row, "ph", "sensor_ph"))
+    par = _safe_float(_pick(row, "par_ue", "par"))
+    if np.isnan(par):
+        par = _weighted_par_from_main_csv(row)
+
+    exg = _safe_float(_pick(row, "exg_mean", "exg", "exg_mean_exg"))
 
     return np.array([temperature, humidity, co2, ec, ph, par, exg], dtype=np.float32)
+
+
+def resolve_training_data_path(cli_path: str) -> str:
+    """
+    --data 가 비어 있으면 astrofarm_data.jsonl 또는 logs/astrofarm_*.csv 중
+    수정 시각이 가장 최근인 파일을 선택합니다.
+    """
+    cli_path = (cli_path or "").strip()
+    if cli_path:
+        if os.path.isfile(cli_path):
+            return os.path.abspath(cli_path)
+        raise FileNotFoundError(
+            f"데이터 파일이 없습니다: {cli_path}\n\n"
+            "준비 방법:\n"
+            "  • 보드에서 python3 main.py 를 충분히 실행해 logs/astrofarm_YYYYMMDD.csv 생성\n"
+            "  • 또는 astrofarm_fixed.py --mode run 으로 astrofarm_data.jsonl 생성\n"
+            "  • 또는 명시 경로: python3 train_lstm_anomaly.py --data logs/astrofarm_20260515.csv"
+        )
+
+    candidates: List[Tuple[float, str]] = []
+    if os.path.isfile("astrofarm_data.jsonl"):
+        candidates.append((os.path.getmtime("astrofarm_data.jsonl"), "astrofarm_data.jsonl"))
+    for p in glob.glob(os.path.join("logs", "astrofarm_*.csv")):
+        candidates.append((os.path.getmtime(p), p))
+
+    if not candidates:
+        raise FileNotFoundError(
+            "학습용 데이터 파일이 없습니다.\n\n"
+            "먼저 장비에서 main.py 로 로그를 쌓거나,\n"
+            "astrofarm_data.jsonl 을 이 디렉터리에 두고 다시 실행하세요.\n"
+            "(윈도우가 W=60이면 최소 61개 행 이상 필요)"
+        )
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return os.path.abspath(candidates[0][1])
 
 
 def load_rows(data_path: str) -> List[Dict]:
@@ -112,7 +190,12 @@ def build_model(window: int = 60, n_features: int = 7) -> tf.keras.Model:
 
 def main():
     parser = argparse.ArgumentParser(description="AstroFarm LSTM 이상탐지 학습")
-    parser.add_argument("--data", type=str, default="astrofarm_data.jsonl")
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="",
+        help="학습 데이터(.jsonl 또는 .csv). 비우면 astrofarm_data.jsonl 또는 logs/ 최신 CSV 자동 선택",
+    )
     parser.add_argument("--window", type=int, default=60)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -126,7 +209,9 @@ def main():
     os.makedirs(os.path.dirname(args.scaler_out) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.meta_out) or ".", exist_ok=True)
 
-    rows = load_rows(args.data)
+    data_path = resolve_training_data_path(args.data)
+    print(f"[train_lstm_anomaly] 데이터: {data_path}")
+    rows = load_rows(data_path)
     data = rows_to_feature_matrix(rows)
     x_raw, y_raw = make_sliding_windows(data, window=args.window)
 

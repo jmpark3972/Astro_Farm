@@ -58,3 +58,15 @@ python main.py --uart-port /dev/ttyS0 --baudrate 38400 --target-temp 22
 ```bash
 python astrofarm_fixed.py --mode test
 ```
+
+## LSTM 학습 데이터
+
+- `astrofarm_fixed.py --mode run` 은 기본적으로 `astrofarm_data.jsonl` 에 한 줄씩 기록합니다.
+- `main.py` 는 `logs/astrofarm_YYYYMMDD.csv` 에 기록합니다.
+- `train_lstm_anomaly.py` 는 `--data` 를 비우면 **같은 폴더의 `astrofarm_data.jsonl`** 과 **`logs/` 안 최신 CSV** 중 수정 시각이 더 최근인 파일을 자동으로 고릅니다.
+- 슬라이딩 윈도우 `W=60` 이면 **최소 61행 이상** 필요합니다.
+
+```bash
+python3 train_lstm_anomaly.py
+python3 train_lstm_anomaly.py --data logs/astrofarm_20260515.csv
+```
