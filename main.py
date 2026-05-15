@@ -26,6 +26,7 @@ from threading import Event
 from typing import Any, Dict, Optional
 
 from astrofarm_fixed import (
+    DHT11_BCM_PIN,
     ExGAnalyzer,
     HARDWARE,
     SensorManager,
@@ -141,12 +142,23 @@ class AstroFarmMain:
             period_sec=min(5.0, self.loop_sec),
             dht_bcm_pin=args.dht_bcm,
         )
+
+        dht_pin = int(args.dht_bcm if args.dht_bcm is not None else DHT11_BCM_PIN)
+        if HARDWARE and dht_pin == int(args.relay_en_pin):
+            log.error(
+                "핀 충돌: DHT11 BCM GPIO %d 와 펠티어 릴레이 EN 이 동일합니다. "
+                "다른 핀으로 분리하거나 --dht-bcm / --relay-en-pin 을 조정하세요.",
+                dht_pin,
+            )
+
         self.temp_ctrl = TemperatureController(
             kp=args.kp,
             ki=args.ki,
             kd=args.kd,
             target_temp=args.target_temp,
             control_period_sec=10.0,
+            relay_enable_pin=int(args.relay_en_pin),
+            relay_dir_pin=int(args.relay_dir_pin),
         )
         self.lstm = LSTMInference(
             model_path=args.model,
@@ -335,7 +347,21 @@ def parse_args():
         type=int,
         default=None,
         metavar="N",
-        help="DHT11 BCM GPIO 번호 (예: 17). 생략 시 ASTROFARM_DHT_BCM 환경변수 또는 기본 17",
+        help="DHT11 BCM GPIO (기본 4). 펠티어 릴레이 EN 핀과 같으면 안 됩니다.",
+    )
+    parser.add_argument(
+        "--relay-en-pin",
+        type=int,
+        default=17,
+        metavar="N",
+        help="펠티어 릴레이 Enable BCM GPIO (기본 17)",
+    )
+    parser.add_argument(
+        "--relay-dir-pin",
+        type=int,
+        default=27,
+        metavar="N",
+        help="펠티어 릴레이 방향 BCM GPIO (기본 27)",
     )
     parser.add_argument(
         "--loop-sec",

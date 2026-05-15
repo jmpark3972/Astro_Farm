@@ -4,8 +4,8 @@
 사용 예:
   python3 sensor_test.py              # 대화형 메뉴
   python3 sensor_test.py dht11
-  python3 sensor_test.py dht11                      # 기본 BCM GPIO17
-  python3 sensor_test.py --dht-bcm 4 dht11         # BCM GPIO4로 바꿀 때
+  python3 sensor_test.py dht11                      # 기본 BCM GPIO4
+  python3 sensor_test.py --dht-bcm 22 dht11        # 다른 BCM으로 테스트
   ASTROFARM_DHT_BCM=22 python3 sensor_test.py dht11
   python3 sensor_test.py as7262
   python3 sensor_test.py ads1015
@@ -124,7 +124,7 @@ def main() -> int:
         type=int,
         default=None,
         metavar="N",
-        help="DHT11 BCM GPIO 번호 (미지정 시 환경변수 ASTROFARM_DHT_BCM 또는 기본 17)",
+        help="DHT11 BCM GPIO 번호 (미지정 시 환경변수 ASTROFARM_DHT_BCM 또는 기본 4)",
     )
     parser.add_argument(
         "sensor",

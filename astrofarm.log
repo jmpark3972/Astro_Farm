@@ -72,3 +72,8 @@
 2026-05-15 22:45:40,175 [INFO] [MOCK] MockSensorManager 초기화 (period=5.0s)
 2026-05-15 22:57:44,164 [WARNING] NTC: 단선 의심 (전압 3.290V)
 2026-05-15 22:57:44,164 [WARNING] NTC: 단락 의심 (전압 0.001V)
+2026-05-15 23:08:04,625 [INFO] [SIM] TemperatureController 시뮬레이션 모드
+2026-05-15 23:08:04,625 [INFO] [SIM] TemperatureController 시뮬레이션 모드
+2026-05-15 23:08:04,626 [INFO] [SIM] TemperatureController 시뮬레이션 모드
+2026-05-15 23:08:04,627 [ERROR] TemperatureController temp_air 누락: 제어 생략
+2026-05-15 23:08:04,627 [INFO] [SIM] TemperatureController 시뮬레이션 모드

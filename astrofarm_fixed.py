@@ -4,7 +4,7 @@ AstroFarm - 달 기지 스마트팜 통합 제어 시스템 + 테스트/시뮬�
 Raspberry Pi Zero 2W OBC
 
 하드웨어 구성:
-  DHT11        : 온습도 센서               (BCM GPIO 기본 17 — 환경변수 ASTROFARM_DHT_BCM)
+  DHT11        : 온습도 센서               (BCM GPIO 기본 4 — 펠티어 릴레이 EN과 같은 핀 금지)
   RX-9 Simple  : CO2 센서 (전기화학식)     (Analog EMF  -> ADS1015 CH2)
                   내장 서미스터(NTC)        (Analog      -> ADS1015 CH3)
   AS7262       : 6채널 분광 센서           (I2C, 0x49)
@@ -107,8 +107,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# DHT11 데이터선 BCM 번호(물리 핀 번호 아님). 기본 17. 변경 예: export ASTROFARM_DHT_BCM=4
-DHT11_BCM_PIN = _env_int("ASTROFARM_DHT_BCM", 17)
+# DHT11 BCM 번호. 기본 4 (GPIO17은 펠티어 릴레이 EN 기본값과 충돌). 변경: export ASTROFARM_DHT_BCM=22
+DHT11_BCM_PIN = _env_int("ASTROFARM_DHT_BCM", 4)
 
 # =========================================================================
 #  데이터 클래스
@@ -243,7 +243,7 @@ class PIDController:
         self._prev_time = time.time()
 
 # =========================================================================
-#  DHT11 온습도 센서 (BCM GPIO, 기본 17 — ASTROFARM_DHT_BCM 으로 변경)
+#  DHT11 온습도 센서 (BCM GPIO, 기본 4 — ASTROFARM_DHT_BCM 으로 변경)
 # =========================================================================
 
 class DHT11Sensor:
@@ -1470,7 +1470,7 @@ class PhotoperiodScheduler:
 class SensorManager:
     """
     요구사항 기반 통합 센서 매니저
-      - DHT11(BCM GPIO, 기본 17 / ASTROFARM_DHT_BCM): temp_air, humidity
+      - DHT11(BCM GPIO, 기본 4 / ASTROFARM_DHT_BCM): temp_air, humidity
       - AS7262(I2C): par_450~par_650
       - ADS1015(I2C): A0=EC, A1=pH, A2=RX-9 CO2, A3=수온(10k NTC + 10k 상부저항)
       - AS7262/ADS1015는 ThreadPoolExecutor로 병렬 읽기
@@ -1811,6 +1811,7 @@ class TemperatureController:
         self.relay_on = False
         self.relay_mode = "OFF"   # OFF / HEAT / COOL
         self.last_output = 0.0
+        self._gpio_ready = False
 
         if HARDWARE:
             try:
@@ -1819,12 +1820,14 @@ class TemperatureController:
                 GPIO.setup(self.relay_dir_pin, GPIO.OUT)
                 GPIO.output(self.relay_enable_pin, GPIO.LOW)
                 GPIO.output(self.relay_dir_pin, GPIO.LOW)
+                self._gpio_ready = True
                 log.info(
                     "TemperatureController 초기화 (EN=%d, DIR=%d, target=%.1fC)",
                     self.relay_enable_pin, self.relay_dir_pin, self.target_temp
                 )
             except Exception as e:
                 log.error("TemperatureController GPIO 초기화 실패: %s", e)
+                self._gpio_ready = False
         else:
             log.info("[SIM] TemperatureController 시뮬레이션 모드")
 
@@ -1843,6 +1846,9 @@ class TemperatureController:
         if not HARDWARE:
             return
 
+        if not self._gpio_ready:
+            return
+
         try:
             # relay_enable: HIGH=ON, LOW=OFF
             # relay_dir   : LOW=HEAT, HIGH=COOL
@@ -1853,6 +1859,7 @@ class TemperatureController:
                 GPIO.output(self.relay_dir_pin, GPIO.LOW)
         except Exception as e:
             log.error("TemperatureController 릴레이 출력 실패: %s", e)
+            self._gpio_ready = False
 
     def control_once(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1866,7 +1873,8 @@ class TemperatureController:
         current_temp = sensor_data.get("temp_air")
         if current_temp is None:
             log.error("TemperatureController temp_air 누락: 제어 생략")
-            self._apply_relay("OFF", False)
+            if self._gpio_ready:
+                self._apply_relay("OFF", False)
             return {
                 "current_temp": None,
                 "error": None,
