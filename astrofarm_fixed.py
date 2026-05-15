@@ -355,18 +355,18 @@ class RX9SimpleCO2:
 
         try:
             v = self._therm_ch.voltage
-            if v >= self.THERM_VCC - 0.01:
-                log.warning("서미스터 단선 의심")
+            t = ntc_divider_temp_c(
+                v,
+                vcc=self.THERM_VCC,
+                r_ref_ohm=self.THERM_R_REF,
+                r0_ohm=self.THERM_R_NOM,
+                beta=self.THERM_B_COEFF,
+                t0_c=self.THERM_T_NOM,
+                log_prefix="RX-9 서미스터(CH3)",
+            )
+            if t is None:
                 return -999.0
-            if v <= 0.01:
-                log.warning("서미스터 단락 의심")
-                return -999.0
-
-            r_ntc = (self.THERM_R_REF * v) / (self.THERM_VCC - v)
-            t_nom_k = self.THERM_T_NOM + 273.15
-            inv_t = (1.0 / t_nom_k) + (1.0 / self.THERM_B_COEFF) * math.log(r_ntc / self.THERM_R_NOM)
-            temp_c = (1.0 / inv_t) - 273.15
-            return round(temp_c, 1)
+            return round(t, 1)
         except Exception as e:
             log.error("서미스터 오류: %s", e)
             return -999.0
@@ -421,6 +421,46 @@ class RX9SimpleCO2:
         self.EMF_ZERO = emf_at_400
         self.SLOPE = (emf_at_400 - emf_at_4000)
         log.info("RX-9 교정: ZERO=%.1f  SLOPE=%.1f", self.EMF_ZERO, self.SLOPE)
+
+
+def ntc_divider_temp_c(
+    v_adc: float,
+    *,
+    vcc: float = 3.3,
+    r_ref_ohm: float = 10000.0,
+    r0_ohm: float = 10000.0,
+    beta: float = 3950.0,
+    t0_c: float = 25.0,
+    log_prefix: str = "NTC",
+) -> Optional[float]:
+    """
+    상부 고정저항 r_ref_ohm — 접점 — 하부 NTC(그라운드) 분배기에서 접점 전압 v_adc 로부터 온도(°C).
+
+    RX-9 CH3 서미스터·일반 10k NTC 수온 프로브에 동일 회로 가정:
+      VCC — [Rref] — A/D — [NTC] — GND
+    """
+    if v_adc >= vcc - 0.02:
+        log.warning("%s: 단선 의심 (전압 %.3fV)", log_prefix, v_adc)
+        return None
+    if v_adc <= 0.02:
+        log.warning("%s: 단락 의심 (전압 %.3fV)", log_prefix, v_adc)
+        return None
+    try:
+        denom = vcc - v_adc
+        if denom <= 0:
+            return None
+        r_ntc = (r_ref_ohm * v_adc) / denom
+        if r_ntc <= 0:
+            return None
+        t0_k = t0_c + 273.15
+        inv_t = (1.0 / t0_k) + (1.0 / beta) * math.log(r_ntc / r0_ohm)
+        if inv_t <= 0:
+            return None
+        return round((1.0 / inv_t) - 273.15, 2)
+    except (ValueError, ZeroDivisionError, OverflowError) as e:
+        log.error("%s 변환 실패: %s", log_prefix, e)
+        return None
+
 
 # =========================================================================
 #  AS7262 분광 센서 (I2C 0x49)
@@ -1432,7 +1472,7 @@ class SensorManager:
     요구사항 기반 통합 센서 매니저
       - DHT11(BCM GPIO, 기본 17 / ASTROFARM_DHT_BCM): temp_air, humidity
       - AS7262(I2C): par_450~par_650
-      - ADS1015(I2C): A0=EC, A1=pH, A2=RX-9 CO2, A3=NTSF-4 water_temp
+      - ADS1015(I2C): A0=EC, A1=pH, A2=RX-9 CO2, A3=수온(10k NTC + 10k 상부저항)
       - AS7262/ADS1015는 ThreadPoolExecutor로 병렬 읽기
       - 기본 읽기 주기: 5초
     """
@@ -1456,7 +1496,7 @@ class SensorManager:
         self._spectral = None
 
         # ADS1015 채널 매핑 (요구사항 고정)
-        # A0: SEN0244(EC), A1: CRT14016P(pH), A2: RX-9 CO2, A3: NTSF-4(수온)
+        # A0: SEN0244(EC), A1: CRT14016P(pH), A2: RX-9 CO2, A3: 10k NTC 수온(상부 10k)
         self._ads = None
         self._ec_ch = None
         self._ph_ch = None
@@ -1559,11 +1599,15 @@ class SensorManager:
         except Exception as e:
             log.error("SensorManager CO2(A2) 읽기 실패: %s", e)
 
-        # A3 -> NTSF-4(수온) : 0~3.3V -> 0~100C 선형 변환 (현장 교정 권장)
+        # A3 -> 10k NTC 수온: VCC(3.3V)—10k—A3—NTC(10k @25C)—GND, 베타 3950 (RX-9 CH3와 동일 가정)
         try:
             v_wt = self._water_temp_ch.voltage
-            wtemp = (v_wt / 3.3) * 100.0
-            out["water_temp"] = round(self._clip(wtemp, -10.0, 100.0), 2)
+            wtemp = ntc_divider_temp_c(
+                v_wt,
+                log_prefix="수온 NTC(A3)",
+            )
+            if wtemp is not None:
+                out["water_temp"] = round(self._clip(wtemp, -10.0, 120.0), 2)
         except Exception as e:
             log.error("SensorManager water_temp(A3) 읽기 실패: %s", e)
 
