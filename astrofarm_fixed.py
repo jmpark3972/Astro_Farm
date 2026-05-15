@@ -13,7 +13,7 @@ Raspberry Pi Zero 2W OBC
                   CH1 -> SEN0244 TDS 센서
                   CH2 -> RX-9 Simple CO2 EMF 출력
                   CH3 -> RX-9 Simple Thermistor (NTC)
-  XBee         : 920MHz 통신 모듈          (UART 38400, TX=GPIO14, RX=GPIO15)
+  XBee         : 920MHz 통신 모듈          (UART, TX=GPIO14, RX=GPIO15)
   Pi Camera V2 : 8MP 식물 촬영             (CSI-2, picamera2)
   Peltier      : 온도 제어                 (GPIO 17, PWM)
   WS2812B      : NeoPixel RGB LED          (GPIO 18, 데이터)
@@ -35,8 +35,8 @@ MG92B 서보 제어:
 ADS1015 채널 배치:
   CH0 (A0) -> CRT14016P pH 센서       (0~3.3V -> pH 0~14)
   CH1 (A1) -> SEN0244 TDS 센서        (0~2.3V -> 0~1000ppm)
-  CH2 (A2) -> RX-9 Simple CO2 EMF     (0~1.5V -> 0~5000ppm)
-  CH3 (A3) -> RX-9 Simple Thermistor  (NTC, 센서 온도 보상용)
+  CH2 (A2) -> RX-9 Simple CO2 EMThermistorF     (0~1.5V -> 0~5000ppm)
+  CH3 (A3) -> RX-9 Simple   (NTC, 센서 온도 보상용)
 
 실행 방법:
   python astrofarm.py --mode sim   (시뮬레이션, 기본)
@@ -69,8 +69,7 @@ try:
     import board
     import busio
     import adafruit_dht
-    import adafruit_ads1x15.ads1015 as ADS
-    from adafruit_ads1x15.analog_in import AnalogIn
+    from adafruit_ads1x15 import ADS1015, AnalogIn, ads1x15s
     import neopixel
     import RPi.GPIO as GPIO
     import serial
@@ -489,11 +488,11 @@ class WaterQuality:
         self._therm_chan = None
 
         if HARDWARE and i2c is not None:
-            self._ads = ADS.ADS1015(i2c)
-            self._ph_chan = AnalogIn(self._ads, ADS.P0)
-            self._tds_chan = AnalogIn(self._ads, ADS.P1)
-            self._co2_chan = AnalogIn(self._ads, ADS.P2)
-            self._therm_chan = AnalogIn(self._ads, ADS.P3)
+            self._ads = ADS1015(i2c)
+            self._ph_chan = AnalogIn(self._ads, ads1x15.Pin.A0)
+            self._tds_chan = AnalogIn(self._ads, ads1x15.Pin.A1)
+            self._co2_chan = AnalogIn(self._ads, ads1x15.Pin.A2)
+            self._therm_chan = AnalogIn(self._ads, ads1x15.Pin.A3)
             log.info("ADS1015 초기화 (CH0=pH, CH1=TDS, CH2=CO2, CH3=Therm)")
         else:
             log.info("[SIM] ADS1015 시뮬레이션 모드")
@@ -800,7 +799,7 @@ class ActuatorHub:
 class XBeeComm:
 
     HEADER = b"\xAF\xAF"
-    BAUD = 38400
+    BAUD = 9600
     ONE_WAY_DELAY_SEC = 1.28
 
     def __init__(self, port: str = "/dev/ttyS0", baudrate: int = BAUD,
@@ -1442,11 +1441,6 @@ class SensorManager:
                 )
             except Exception as e:
                 log.error("SensorManager ADS1015 초기화 실패: %s", e)
-                self._ads = None
-                self._ec_ch = None
-                self._ph_ch = None
-                self._co2_ch = None
-                self._water_temp_ch = None
         else:
             self._spectral = AS7262Sensor(None)
             log.info("[SIM] SensorManager 시뮬레이션 모드")
@@ -1489,11 +1483,6 @@ class SensorManager:
             out["ph"] = round(random.uniform(5.7, 6.8), 2)
             out["co2"] = int(random.uniform(450, 1300))
             out["water_temp"] = round(random.uniform(20.0, 27.0), 1)
-            return out
-
-        # 초기화 실패 시 채널 없음 → None 유지하고 추가 로그만 남김
-        if self._ads is None or self._ec_ch is None:
-            log.warning("SensorManager ADS1015 없음: EC/pH/CO2/water_temp 건너뜀")
             return out
 
         # A0 -> SEN0244(EC)
