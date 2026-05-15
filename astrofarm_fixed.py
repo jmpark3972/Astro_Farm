@@ -51,14 +51,16 @@ ADS1015 채널 배치:
 import time
 import math
 import json
+import os
 import struct
 import logging
 import random
 import threading
 import unittest
 from dataclasses import dataclass, asdict, field
-from typing import Optional, List, Tuple
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional, List, Tuple, Dict, Any
+from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
 # 하드웨어 모듈 임포트 시도, 실패하면 시뮬레이션 모드
@@ -127,6 +129,10 @@ class SensorData:
     # ExG 카메라 분석
     exg_mean:        float = 0.0
     green_ratio:     float = 0.0
+    vari_mean:       float = 0.0
+    ngrdi_mean:      float = 0.0
+    color_index:     float = 0.0
+    color_grade:     str   = "UNKNOWN"
 
 @dataclass
 class ControlConfig:
@@ -774,33 +780,190 @@ class XBeeComm:
 
     HEADER = b"\xAF\xAF"
     BAUD = 9600
+    ONE_WAY_DELAY_SEC = 1.28
 
-    def __init__(self, port: str = "/dev/ttyS0"):
+    def __init__(self, port: str = "/dev/ttyS0", baudrate: int = BAUD,
+                 one_way_delay_sec: float = ONE_WAY_DELAY_SEC):
         self._ser = None
+        self._tx_seq = 0
+        self._rx_expected_seq = None
+        self._rx_last_seq = None
+        self._rx_lost_packets = 0
+        self._delay_sec = max(0.0, float(one_way_delay_sec))
+
         if HARDWARE:
             try:
                 self._ser = serial.Serial(
-                    port, self.BAUD, timeout=1.0, write_timeout=1.0)
-                log.info("XBee 연결: %s @ %d", port, self.BAUD)
+                    port, int(baudrate), timeout=1.0, write_timeout=1.0)
+                log.info("XBee 연결: %s @ %d (delay=%.2fs)",
+                         port, int(baudrate), self._delay_sec)
             except Exception as e:
                 log.warning("XBee 연결 실패: %s", e)
         else:
             log.info("[SIM] XBee 시뮬레이션 모드")
 
-    def send_telemetry(self, data: SensorData) -> bool:
-        payload = json.dumps(asdict(data), separators=(",", ":")).encode()
+    @staticmethod
+    def _to_dict(data) -> dict:
+        if isinstance(data, SensorData):
+            return asdict(data)
+        if isinstance(data, dict):
+            return data
+        return {}
+
+    @classmethod
+    def _extract_control_state(cls, sensor_data) -> dict:
+        src = cls._to_dict(sensor_data)
+        keys = [
+            "peltier_pct",
+            "led_brightness", "led_r", "led_g", "led_b",
+            "led_blue_pct", "led_red_pct",
+            "servo_angle", "servo_feeding",
+        ]
+        return {k: src.get(k) for k in keys if k in src}
+
+    @classmethod
+    def _extract_exg_result(cls, sensor_data) -> dict:
+        src = cls._to_dict(sensor_data)
+        keys = [
+            "exg_mean", "green_ratio", "vari_mean", "ngrdi_mean",
+            "color_index", "color_grade",
+        ]
+        return {k: src.get(k) for k in keys if k in src}
+
+    def _build_frame(self, payload_obj: dict) -> bytes:
+        payload = json.dumps(payload_obj, separators=(",", ":"), ensure_ascii=False).encode()
         length = len(payload).to_bytes(2, "big")
-        packet = self.HEADER + length + payload
+        return self.HEADER + length + payload
+
+    def _send_frame(self, payload_obj: dict) -> bool:
+        frame = self._build_frame(payload_obj)
+
+        # 지구->달 편도 지연(소프트웨어 모사)
+        if self._delay_sec > 0:
+            time.sleep(self._delay_sec)
 
         if self._ser and self._ser.is_open:
             try:
-                self._ser.write(packet)
+                self._ser.write(frame)
                 return True
             except Exception as e:
                 log.error("XBee TX 오류: %s", e)
         else:
-            log.debug("[SIM] TX %dB", len(payload))
+            log.debug("[SIM] TX %dB: %s", len(frame), payload_obj.get("msg_type", "unknown"))
         return False
+
+    def send_telemetry(self,
+                       sensor_data,
+                       control_state: Optional[dict] = None,
+                       lstm_prediction: Optional[dict] = None,
+                       exg_result: Optional[dict] = None) -> bool:
+        """
+        텔레메트리 송신:
+          sensor dict + control state + LSTM 예측 + ExG 결과를 JSON 패킷화
+        """
+        if control_state is None:
+            control_state = self._extract_control_state(sensor_data)
+        if exg_result is None:
+            exg_result = self._extract_exg_result(sensor_data)
+
+        packet = {
+            "msg_type": "telemetry",
+            "seq": int(self._tx_seq),
+            "sent_at": datetime.now().isoformat(),
+            "sensor": self._to_dict(sensor_data),
+            "control_state": control_state or {},
+            "lstm_prediction": lstm_prediction or {},
+            "exg_result": exg_result or {},
+        }
+        ok = self._send_frame(packet)
+        self._tx_seq = (self._tx_seq + 1) % (2**31)
+        return ok
+
+    def _check_rx_sequence(self, seq: Optional[int]):
+        if seq is None:
+            return
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            return
+
+        if self._rx_expected_seq is None:
+            self._rx_expected_seq = seq + 1
+            self._rx_last_seq = seq
+            return
+
+        if seq != self._rx_expected_seq:
+            if seq > self._rx_expected_seq:
+                lost = seq - self._rx_expected_seq
+                self._rx_lost_packets += lost
+                log.warning(
+                    "XBee 패킷 손실 감지: expected=%d, got=%d, lost=%d, total_lost=%d",
+                    self._rx_expected_seq, seq, lost, self._rx_lost_packets
+                )
+            else:
+                log.warning(
+                    "XBee 시퀀스 역전/중복: expected=%d, got=%d",
+                    self._rx_expected_seq, seq
+                )
+        self._rx_expected_seq = seq + 1
+        self._rx_last_seq = seq
+
+    def _normalize_telecommand(self, cmd: dict) -> dict:
+        """
+        명령 종류 분기:
+          - 온도설정
+          - 광레시피
+          - 영양액
+          - 모델업데이트
+        """
+        cmd_type = str(
+            cmd.get("command_type")
+            or cmd.get("type")
+            or cmd.get("action")
+            or ""
+        ).strip().lower()
+
+        normalized = dict(cmd)
+        normalized["command_type"] = cmd_type
+        normalized["raw"] = cmd
+
+        if cmd_type in ("온도설정", "temperature", "temp", "set_temp"):
+            normalized["action"] = "set_temp"
+            normalized["value"] = cmd.get("value", cmd.get("target_temp", cmd.get("temp", 22.0)))
+            return normalized
+
+        if cmd_type in ("광레시피", "light_recipe", "light", "set_grow_light"):
+            normalized["action"] = "set_grow_light"
+            normalized["blue"] = cmd.get("blue", cmd.get("blue_pct", 70))
+            normalized["red"] = cmd.get("red", cmd.get("red_pct", 80))
+            return normalized
+
+        if cmd_type in ("영양액", "nutrient", "servo_feed", "servo_start", "servo_stop"):
+            mode = str(cmd.get("mode", cmd.get("action", "once"))).lower()
+            if mode in ("start", "periodic", "servo_start"):
+                normalized["action"] = "servo_start"
+            elif mode in ("stop", "servo_stop"):
+                normalized["action"] = "servo_stop"
+            else:
+                normalized["action"] = "servo_feed"
+            normalized["angle"] = cmd.get("angle", 90)
+            normalized["hold"] = cmd.get("hold", 0.5)
+            normalized["interval"] = cmd.get("interval", 5.0)
+            return normalized
+
+        if cmd_type in ("모델업데이트", "model_update", "update_model"):
+            normalized["action"] = "model_update"
+            normalized["model_version"] = cmd.get("model_version", "")
+            normalized["model_url"] = cmd.get("model_url", "")
+            normalized["checksum"] = cmd.get("checksum", "")
+            return normalized
+
+        # 기존 action 기반 명령도 그대로 전달
+        if "action" in cmd:
+            return normalized
+
+        normalized["action"] = "unknown"
+        return normalized
 
     def receive_command(self) -> Optional[dict]:
         if not self._ser or not self._ser.is_open:
@@ -814,10 +977,22 @@ class XBeeComm:
                 return None
             length = int.from_bytes(self._ser.read(2), "big")
             payload = self._ser.read(length)
-            return json.loads(payload.decode())
+            cmd = json.loads(payload.decode())
+            if isinstance(cmd, dict):
+                self._check_rx_sequence(cmd.get("seq"))
+                return self._normalize_telecommand(cmd)
+            return None
         except Exception as e:
             log.error("XBee RX 오류: %s", e)
             return None
+
+    def stats(self) -> dict:
+        return {
+            "tx_seq": self._tx_seq,
+            "rx_last_seq": self._rx_last_seq,
+            "rx_expected_seq": self._rx_expected_seq,
+            "rx_lost_packets": self._rx_lost_packets,
+        }
 
     def close(self):
         if self._ser and self._ser.is_open:
@@ -828,12 +1003,51 @@ class XBeeComm:
 # =========================================================================
 
 class VisionAnalyzer:
-    """ExG = 2g - r - b (정규화)"""
+    """RGB 기반 식생지수(ExG/VARI/NGRDI) 계산 및 등급 판정"""
 
     def __init__(self, out_dir: str = "captures"):
         import os
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
+
+    @staticmethod
+    def _safe_mean(arr, mask) -> float:
+        if mask is not None and mask.any():
+            return float(arr[mask].mean())
+        return float(arr.mean())
+
+    @staticmethod
+    def _to_unit(value: float) -> float:
+        return max(0.0, min(1.0, (value + 1.0) * 0.5))
+
+    @classmethod
+    def classify_color_index(cls, exg_mean: float, green_ratio: float,
+                             vari_mean: float, ngrdi_mean: float) -> Tuple[float, str]:
+        """
+        RGB 지표를 0~100 스코어로 통합
+        - green_ratio 가중치가 가장 큼 (잎 픽셀 비중)
+        - ExG/VARI/NGRDI는 색상 건강도 보조
+        """
+        exg_u = cls._to_unit(exg_mean)
+        vari_u = cls._to_unit(vari_mean)
+        ngrdi_u = cls._to_unit(ngrdi_mean)
+        gr_u = max(0.0, min(1.0, green_ratio))
+
+        score = 100.0 * (
+            0.40 * gr_u +
+            0.25 * exg_u +
+            0.20 * vari_u +
+            0.15 * ngrdi_u
+        )
+        score = round(max(0.0, min(100.0, score)), 1)
+
+        if score >= 70.0:
+            grade = "GOOD"
+        elif score >= 45.0:
+            grade = "WARN"
+        else:
+            grade = "BAD"
+        return score, grade
 
     def capture(self) -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -860,15 +1074,44 @@ class VisionAnalyzer:
         try:
             import cv2
             import numpy as np
-            img = cv2.imread(path).astype(np.float32)
+            img = cv2.imread(path)
+            if img is None:
+                log.error("이미지 읽기 실패: %s", path)
+                return {}
+
+            img = img.astype(np.float32)
             B, G, R = img[:, :, 0], img[:, :, 1], img[:, :, 2]
             tot = R + G + B + 1e-6
-            exg = (2 * G / tot) - (R / tot) - (B / tot)
-            mask = exg > 0.1
+            r_n = R / tot
+            g_n = G / tot
+            b_n = B / tot
+
+            exg = (2 * g_n) - r_n - b_n
+            vari = (g_n - r_n) / (g_n + r_n - b_n + 1e-6)
+            ngrdi = (g_n - r_n) / (g_n + r_n + 1e-6)
+
+            # 식생 픽셀 우선 분리, 실패 시 전체 픽셀 평균 사용
+            vegetation_mask = exg > 0.08
+            mask = vegetation_mask if vegetation_mask.any() else None
+
+            exg_mean = self._safe_mean(exg, mask)
+            vari_mean = self._safe_mean(vari, mask)
+            ngrdi_mean = self._safe_mean(ngrdi, mask)
+            green_ratio = float(vegetation_mask.sum()) / exg.size
+            color_index, color_grade = self.classify_color_index(
+                exg_mean=exg_mean,
+                green_ratio=green_ratio,
+                vari_mean=vari_mean,
+                ngrdi_mean=ngrdi_mean,
+            )
+
             return {
-                "exg_mean": round(
-                    float(exg[mask].mean()) if mask.any() else 0.0, 4),
-                "green_ratio": round(float(mask.sum()) / mask.size, 4),
+                "exg_mean": round(exg_mean, 4),
+                "green_ratio": round(green_ratio, 4),
+                "vari_mean": round(vari_mean, 4),
+                "ngrdi_mean": round(ngrdi_mean, 4),
+                "color_index": color_index,
+                "color_grade": color_grade,
             }
         except ImportError:
             log.warning("OpenCV 미설치, ExG 생략")
@@ -876,6 +1119,232 @@ class VisionAnalyzer:
         except Exception as e:
             log.error("ExG 오류: %s", e)
             return {}
+
+# =========================================================================
+#  ExG Analyzer (Pi Camera V2 + Otsu + Daily Scheduler)
+# =========================================================================
+
+class ExGAnalyzer:
+    """
+    Raspberry Pi Camera V2 촬영 이미지를 ExG로 분석
+      - 정규화: r=R/(R+G+B), g=G/(R+G+B), b=B/(R+G+B)
+      - ExG = 2g - r - b
+      - Otsu 이진화로 식물 영역 마스크 생성
+      - 전일 대비 mean_exg 10% 이상 하락 시 경고 플래그
+      - 매일 같은 시각 자동 촬영 스케줄 지원
+    """
+
+    DROP_WARN_PCT = 10.0
+
+    def __init__(self, out_dir: str = "captures", history_file: str = "exg_daily_history.json"):
+        self.out_dir = out_dir
+        os.makedirs(out_dir, exist_ok=True)
+        self.history_path = os.path.join(out_dir, history_file)
+
+        self._schedule_thread = None
+        self._schedule_stop = threading.Event()
+        self._scheduled_hhmm = "09:00"
+
+    def capture_image(self) -> str:
+        """picamera2로 still image 캡처"""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.out_dir, f"exg_{ts}.jpg")
+        if HARDWARE:
+            try:
+                from picamera2 import Picamera2
+                cam = Picamera2()
+                cam.configure(cam.create_still_configuration(main={"size": (1920, 1080)}))
+                cam.start()
+                time.sleep(1.5)
+                cam.capture_file(path)
+                cam.stop()
+                cam.close()
+                return path
+            except Exception as e:
+                log.error("ExGAnalyzer 캡처 실패: %s", e)
+                return ""
+        log.warning("ExGAnalyzer 캡처 건너뜀(HARDWARE=False)")
+        return ""
+
+    def _load_history(self) -> Dict[str, float]:
+        if not os.path.exists(self.history_path):
+            return {}
+        try:
+            with open(self.history_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): float(v) for k, v in data.items()}
+        except Exception as e:
+            log.error("ExGAnalyzer 이력 로드 실패: %s", e)
+        return {}
+
+    def _save_history(self, history: Dict[str, float]):
+        try:
+            with open(self.history_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log.error("ExGAnalyzer 이력 저장 실패: %s", e)
+
+    @staticmethod
+    def _calc_drop_warning(today_mean_exg: float, prev_mean_exg: Optional[float],
+                           threshold_pct: float = DROP_WARN_PCT) -> Tuple[bool, float]:
+        """
+        prev 대비 today 하락률 계산
+        drop_pct = ((prev - today) / prev) * 100
+        """
+        if prev_mean_exg is None or prev_mean_exg <= 0:
+            return False, 0.0
+        drop_pct = ((prev_mean_exg - today_mean_exg) / prev_mean_exg) * 100.0
+        return drop_pct >= threshold_pct, round(drop_pct, 2)
+
+    def analyze_image(self, image_path: str, analysis_date: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        반환:
+          {
+            "coverage_pct": float,
+            "mean_exg": float,
+            "exg_map": ndarray,
+            "drop_warning": bool
+          }
+        """
+        if analysis_date is None:
+            analysis_date = datetime.now()
+
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            log.error("ExGAnalyzer OpenCV/Numpy 미설치")
+            return {
+                "coverage_pct": None,
+                "mean_exg": None,
+                "exg_map": None,
+                "drop_warning": False,
+            }
+
+        img = cv2.imread(image_path)
+        if img is None:
+            log.error("ExGAnalyzer 이미지 읽기 실패: %s", image_path)
+            return {
+                "coverage_pct": None,
+                "mean_exg": None,
+                "exg_map": None,
+                "drop_warning": False,
+            }
+
+        img = img.astype(np.float32)
+        b = img[:, :, 0]
+        g = img[:, :, 1]
+        r = img[:, :, 2]
+        denom = r + g + b + 1e-6
+
+        # 정규화 채널
+        r_n = r / denom
+        g_n = g / denom
+        b_n = b / denom
+
+        # ExG 지수
+        exg_map = (2.0 * g_n) - r_n - b_n
+
+        # Otsu 마스크
+        exg_u8 = cv2.normalize(exg_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        _, mask = cv2.threshold(exg_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        mask_bool = mask > 0
+
+        coverage_pct = float(mask_bool.sum()) * 100.0 / float(mask_bool.size)
+        if mask_bool.any():
+            mean_exg = float(exg_map[mask_bool].mean())
+        else:
+            mean_exg = float(exg_map.mean())
+
+        today_key = analysis_date.strftime("%Y-%m-%d")
+        prev_key = (analysis_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        history = self._load_history()
+        prev_mean = history.get(prev_key)
+        drop_warning, drop_pct = self._calc_drop_warning(mean_exg, prev_mean, self.DROP_WARN_PCT)
+
+        history[today_key] = round(mean_exg, 6)
+        self._save_history(history)
+
+        return {
+            "coverage_pct": round(coverage_pct, 2),
+            "mean_exg": round(mean_exg, 6),
+            "exg_map": exg_map,
+            "drop_warning": drop_warning,
+            "drop_pct": drop_pct,
+            "prev_day_mean_exg": prev_mean,
+            "image_path": image_path,
+            "timestamp": analysis_date.isoformat(),
+        }
+
+    def capture_and_analyze(self) -> Dict[str, Any]:
+        path = self.capture_image()
+        if not path:
+            return {
+                "coverage_pct": None,
+                "mean_exg": None,
+                "exg_map": None,
+                "drop_warning": False,
+                "drop_pct": 0.0,
+                "prev_day_mean_exg": None,
+                "image_path": "",
+                "timestamp": datetime.now().isoformat(),
+            }
+        return self.analyze_image(path)
+
+    @staticmethod
+    def _parse_hhmm(hhmm: str) -> Tuple[int, int]:
+        try:
+            hh, mm = hhmm.strip().split(":")
+            hour = max(0, min(23, int(hh)))
+            minute = max(0, min(59, int(mm)))
+            return hour, minute
+        except Exception:
+            return 9, 0
+
+    def _seconds_until_next_run(self, hhmm: str) -> float:
+        hour, minute = self._parse_hhmm(hhmm)
+        now = datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target = target + timedelta(days=1)
+        return max(1.0, (target - now).total_seconds())
+
+    def start_daily_schedule(self, capture_time_hhmm: str = "09:00", handler=None):
+        """
+        매일 같은 시각 자동 촬영/분석 시작
+        - capture_time_hhmm: "HH:MM"
+        - handler(result_dict): 분석 결과 콜백(옵션)
+        """
+        if self._schedule_thread and self._schedule_thread.is_alive():
+            log.warning("ExGAnalyzer 스케줄이 이미 실행 중")
+            return
+
+        self._scheduled_hhmm = capture_time_hhmm
+        self._schedule_stop.clear()
+
+        def _loop():
+            log.info("ExGAnalyzer 일일 스케줄 시작 (%s)", self._scheduled_hhmm)
+            while not self._schedule_stop.is_set():
+                wait_sec = self._seconds_until_next_run(self._scheduled_hhmm)
+                if self._schedule_stop.wait(timeout=wait_sec):
+                    break
+                result = self.capture_and_analyze()
+                if handler is not None:
+                    try:
+                        handler(result)
+                    except Exception as e:
+                        log.error("ExGAnalyzer handler 오류: %s", e)
+            log.info("ExGAnalyzer 일일 스케줄 중단")
+
+        self._schedule_thread = threading.Thread(target=_loop, daemon=True)
+        self._schedule_thread.start()
+
+    def stop_daily_schedule(self):
+        self._schedule_stop.set()
+        if self._schedule_thread is not None:
+            self._schedule_thread.join(timeout=5.0)
+            self._schedule_thread = None
 
 # =========================================================================
 #  광주기 스케줄러
@@ -896,6 +1365,425 @@ class PhotoperiodScheduler:
         if self.start_hour < end:
             return self.start_hour <= now < end
         return now >= self.start_hour or now < end
+
+# =========================================================================
+#  SensorManager (요구사항 전용 통합 읽기)
+# =========================================================================
+
+class SensorManager:
+    """
+    요구사항 기반 통합 센서 매니저
+      - DHT11(GPIO4): temp_air, humidity
+      - AS7262(I2C): par_450~par_650
+      - ADS1015(I2C): A0=EC, A1=pH, A2=RX-9 CO2, A3=NTSF-4 water_temp
+      - AS7262/ADS1015는 ThreadPoolExecutor로 병렬 읽기
+      - 기본 읽기 주기: 5초
+    """
+
+    READ_PERIOD_SEC = 5.0
+    RX9_EMF_ZERO_MV = 300.0
+    RX9_SLOPE = 55.0
+
+    def __init__(self, period_sec: float = READ_PERIOD_SEC):
+        self.period_sec = max(0.1, float(period_sec))
+        self._last_read = 0.0
+
+        self._i2c = None
+        self._executor = ThreadPoolExecutor(max_workers=2)
+
+        self._dht = DHT11Sensor()
+        self._spectral = None
+
+        # ADS1015 채널 매핑 (요구사항 고정)
+        # A0: SEN0244(EC), A1: CRT14016P(pH), A2: RX-9 CO2, A3: NTSF-4(수온)
+        self._ads = None
+        self._ec_ch = None
+        self._ph_ch = None
+        self._co2_ch = None
+        self._water_temp_ch = None
+
+        if HARDWARE:
+            try:
+                self._i2c = busio.I2C(board.SCL, board.SDA)
+                self._spectral = AS7262Sensor(self._i2c)
+            except Exception as e:
+                log.error("SensorManager I2C 초기화 실패: %s", e)
+                self._spectral = AS7262Sensor(None)
+
+            try:
+                self._ads = ADS.ADS1015(self._i2c)
+                self._ec_ch = AnalogIn(self._ads, ADS.P0)
+                self._ph_ch = AnalogIn(self._ads, ADS.P1)
+                self._co2_ch = AnalogIn(self._ads, ADS.P2)
+                self._water_temp_ch = AnalogIn(self._ads, ADS.P3)
+                log.info(
+                    "SensorManager ADS1015 채널 매핑: A0=EC, A1=pH, A2=CO2, A3=water_temp"
+                )
+            except Exception as e:
+                log.error("SensorManager ADS1015 초기화 실패: %s", e)
+        else:
+            self._spectral = AS7262Sensor(None)
+            log.info("[SIM] SensorManager 시뮬레이션 모드")
+
+    @staticmethod
+    def _clip(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    @classmethod
+    def _co2_from_emf_mv(cls, emf_mv: float) -> Optional[int]:
+        try:
+            if emf_mv is None:
+                return None
+            delta = cls.RX9_EMF_ZERO_MV - emf_mv
+            ppm = int(400 * math.pow(10, delta / cls.RX9_SLOPE))
+            return int(cls._clip(ppm, 0, 5000))
+        except Exception as e:
+            log.error("SensorManager CO2 변환 실패: %s", e)
+            return None
+
+    def _read_dht11(self) -> Dict[str, Optional[float]]:
+        temp_air, humidity = self._dht.read()
+        if temp_air is None or humidity is None:
+            log.error("SensorManager DHT11 읽기 실패")
+        return {
+            "temp_air": temp_air,
+            "humidity": humidity,
+        }
+
+    def _read_ads1015_bundle(self) -> Dict[str, Optional[float]]:
+        out = {
+            "co2": None,
+            "ec": None,
+            "ph": None,
+            "water_temp": None,
+        }
+
+        if not HARDWARE:
+            out["ec"] = round(random.uniform(0.6, 1.8), 3)
+            out["ph"] = round(random.uniform(5.7, 6.8), 2)
+            out["co2"] = int(random.uniform(450, 1300))
+            out["water_temp"] = round(random.uniform(20.0, 27.0), 1)
+            return out
+
+        # A0 -> SEN0244(EC)
+        try:
+            v_ec = self._ec_ch.voltage
+            tds = (133.42 * v_ec**3 - 255.86 * v_ec**2 + 857.39 * v_ec) * 0.5
+            ec = self._clip(tds / 500.0, 0.0, 5.0)
+            out["ec"] = round(ec, 3)
+        except Exception as e:
+            log.error("SensorManager EC(A0) 읽기 실패: %s", e)
+
+        # A1 -> CRT14016P(pH)
+        try:
+            v_ph = self._ph_ch.voltage
+            ph = 7.0 + (1.65 - v_ph) / 0.059
+            out["ph"] = round(self._clip(ph, 0.0, 14.0), 2)
+        except Exception as e:
+            log.error("SensorManager pH(A1) 읽기 실패: %s", e)
+
+        # A2 -> RX-9 Simple(CO2)
+        try:
+            emf_mv = self._co2_ch.voltage * 1000.0
+            out["co2"] = self._co2_from_emf_mv(emf_mv)
+        except Exception as e:
+            log.error("SensorManager CO2(A2) 읽기 실패: %s", e)
+
+        # A3 -> NTSF-4(수온) : 0~3.3V -> 0~100C 선형 변환 (현장 교정 권장)
+        try:
+            v_wt = self._water_temp_ch.voltage
+            wtemp = (v_wt / 3.3) * 100.0
+            out["water_temp"] = round(self._clip(wtemp, -10.0, 100.0), 2)
+        except Exception as e:
+            log.error("SensorManager water_temp(A3) 읽기 실패: %s", e)
+
+        return out
+
+    def _read_as7262_bundle(self) -> Dict[str, Optional[float]]:
+        out = {
+            "par_450": None,
+            "par_500": None,
+            "par_550": None,
+            "par_570": None,
+            "par_600": None,
+            "par_650": None,
+        }
+        try:
+            spec = self._spectral.read() if self._spectral else {}
+            if not spec:
+                log.error("SensorManager AS7262 읽기 실패")
+                return out
+            out["par_450"] = spec.get("ch450")
+            out["par_500"] = spec.get("ch500")
+            out["par_550"] = spec.get("ch550")
+            out["par_570"] = spec.get("ch570")
+            out["par_600"] = spec.get("ch600")
+            out["par_650"] = spec.get("ch650")
+            return out
+        except Exception as e:
+            log.error("SensorManager AS7262 읽기 예외: %s", e)
+            return out
+
+    def read_once(self) -> Dict[str, Any]:
+        """
+        모든 센서를 1회 읽어 dict 반환.
+        반환 예:
+          {
+            "temp_air", "humidity", "co2", "ec", "ph", "water_temp",
+            "par_450", "par_500", "par_550", "par_570", "par_600", "par_650"
+          }
+        """
+        base = self._read_dht11()
+
+        # I2C 장치(AS7262/ADS1015)는 병렬 읽기
+        fut_ads = self._executor.submit(self._read_ads1015_bundle)
+        fut_as = self._executor.submit(self._read_as7262_bundle)
+
+        ads_data = fut_ads.result()
+        as_data = fut_as.result()
+
+        base.update(ads_data)
+        base.update(as_data)
+        base["timestamp"] = datetime.now().isoformat()
+        self._last_read = time.time()
+        return base
+
+    def run_loop(self, handler=None):
+        """
+        5초 주기(기본)로 read_once() 실행.
+        handler를 주면 읽기 결과 dict를 전달.
+        """
+        log.info("SensorManager 루프 시작 (period=%.1fs)", self.period_sec)
+        while True:
+            t0 = time.time()
+            data = self.read_once()
+            if handler is not None:
+                try:
+                    handler(data)
+                except Exception as e:
+                    log.error("SensorManager handler 오류: %s", e)
+            dt = time.time() - t0
+            time.sleep(max(0.0, self.period_sec - dt))
+
+    def close(self):
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self._dht.cleanup()
+        except Exception:
+            pass
+
+# =========================================================================
+#  MockSensorManager (하드웨어 없는 통합 테스트용)
+# =========================================================================
+
+class MockSensorManager:
+    """
+    SensorManager와 동일 인터페이스를 제공하는 목 센서 매니저.
+    - read_once()
+    - run_loop(handler=None)
+    - close()
+    """
+
+    READ_PERIOD_SEC = SensorManager.READ_PERIOD_SEC
+
+    def __init__(self, period_sec: float = READ_PERIOD_SEC):
+        self.period_sec = max(0.1, float(period_sec))
+        self._last_read = 0.0
+        self._closed = False
+        log.info("[MOCK] MockSensorManager 초기화 (period=%.1fs)", self.period_sec)
+
+    def read_once(self) -> Dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("MockSensorManager is closed")
+
+        data = {
+            "temp_air": round(random.uniform(21.0, 25.5), 1),
+            "humidity": round(random.uniform(55.0, 75.0), 1),
+            "co2": int(random.uniform(500, 1200)),
+            "ec": round(random.uniform(0.8, 1.4), 3),
+            "ph": round(random.uniform(5.8, 6.6), 2),
+            "water_temp": round(random.uniform(20.0, 26.0), 1),
+            "par_450": round(random.uniform(20.0, 180.0), 2),
+            "par_500": round(random.uniform(20.0, 180.0), 2),
+            "par_550": round(random.uniform(20.0, 180.0), 2),
+            "par_570": round(random.uniform(20.0, 180.0), 2),
+            "par_600": round(random.uniform(20.0, 180.0), 2),
+            "par_650": round(random.uniform(20.0, 180.0), 2),
+            "timestamp": datetime.now().isoformat(),
+        }
+        self._last_read = time.time()
+        return data
+
+    def run_loop(self, handler=None):
+        log.info("MockSensorManager 루프 시작 (period=%.1fs)", self.period_sec)
+        while not self._closed:
+            t0 = time.time()
+            data = self.read_once()
+            if handler is not None:
+                try:
+                    handler(data)
+                except Exception as e:
+                    log.error("MockSensorManager handler 오류: %s", e)
+            dt = time.time() - t0
+            time.sleep(max(0.0, self.period_sec - dt))
+
+    def close(self):
+        self._closed = True
+
+# =========================================================================
+#  TemperatureController (Peltier PID + Relay Direction)
+# =========================================================================
+
+class TemperatureController:
+    """
+    SensorManager 출력(dict)을 입력받아 펠티어 릴레이를 PID로 제어
+      - 목표 온도 범위: 18~26C (기본 22C)
+      - PID gains 주입 가능
+      - 릴레이 ON/OFF + 방향 전환(가열/냉각)
+      - 제어 주기: 10초
+    """
+
+    TARGET_MIN = 18.0
+    TARGET_MAX = 26.0
+    DEFAULT_TARGET = 22.0
+    DEFAULT_PERIOD_SEC = 10.0
+
+    def __init__(self,
+                 kp: float = 2.0,
+                 ki: float = 0.1,
+                 kd: float = 0.5,
+                 target_temp: float = DEFAULT_TARGET,
+                 control_period_sec: float = DEFAULT_PERIOD_SEC,
+                 relay_enable_pin: int = 17,
+                 relay_dir_pin: int = 27,
+                 min_drive_pct: float = 5.0):
+        self.relay_enable_pin = int(relay_enable_pin)
+        self.relay_dir_pin = int(relay_dir_pin)
+        self.control_period_sec = max(0.5, float(control_period_sec))
+        self.min_drive_pct = max(0.0, min(100.0, float(min_drive_pct)))
+
+        self.target_temp = self._clip(float(target_temp), self.TARGET_MIN, self.TARGET_MAX)
+        self.pid = PIDController(
+            kp=kp, ki=ki, kd=kd,
+            setpoint=self.target_temp,
+            output_min=-100.0, output_max=100.0,
+        )
+
+        self.relay_on = False
+        self.relay_mode = "OFF"   # OFF / HEAT / COOL
+        self.last_output = 0.0
+
+        if HARDWARE:
+            try:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setup(self.relay_enable_pin, GPIO.OUT)
+                GPIO.setup(self.relay_dir_pin, GPIO.OUT)
+                GPIO.output(self.relay_enable_pin, GPIO.LOW)
+                GPIO.output(self.relay_dir_pin, GPIO.LOW)
+                log.info(
+                    "TemperatureController 초기화 (EN=%d, DIR=%d, target=%.1fC)",
+                    self.relay_enable_pin, self.relay_dir_pin, self.target_temp
+                )
+            except Exception as e:
+                log.error("TemperatureController GPIO 초기화 실패: %s", e)
+        else:
+            log.info("[SIM] TemperatureController 시뮬레이션 모드")
+
+    @staticmethod
+    def _clip(v: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, v))
+
+    def set_target(self, target_temp: float):
+        self.target_temp = self._clip(float(target_temp), self.TARGET_MIN, self.TARGET_MAX)
+        self.pid.update_setpoint(self.target_temp)
+
+    def _apply_relay(self, mode: str, relay_on: bool):
+        self.relay_mode = mode
+        self.relay_on = relay_on
+
+        if not HARDWARE:
+            return
+
+        try:
+            # relay_enable: HIGH=ON, LOW=OFF
+            # relay_dir   : LOW=HEAT, HIGH=COOL
+            GPIO.output(self.relay_enable_pin, GPIO.HIGH if relay_on else GPIO.LOW)
+            if mode == "COOL":
+                GPIO.output(self.relay_dir_pin, GPIO.HIGH)
+            else:
+                GPIO.output(self.relay_dir_pin, GPIO.LOW)
+        except Exception as e:
+            log.error("TemperatureController 릴레이 출력 실패: %s", e)
+
+    def control_once(self, sensor_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        SensorManager 출력(dict) 기준 1회 제어 수행.
+        반환:
+          {
+            "current_temp", "error", "pid_output",
+            "relay_on", "relay_mode", "target_temp", "timestamp"
+          }
+        """
+        current_temp = sensor_data.get("temp_air")
+        if current_temp is None:
+            log.error("TemperatureController temp_air 누락: 제어 생략")
+            self._apply_relay("OFF", False)
+            return {
+                "current_temp": None,
+                "error": None,
+                "pid_output": None,
+                "relay_on": self.relay_on,
+                "relay_mode": self.relay_mode,
+                "target_temp": self.target_temp,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+        error = self.target_temp - float(current_temp)
+        pid_output = float(self.pid.compute(float(current_temp)))  # -100 ~ +100
+        self.last_output = pid_output
+
+        drive = abs(pid_output)
+        if drive < self.min_drive_pct:
+            self._apply_relay("OFF", False)
+        elif pid_output > 0:
+            # 목표보다 낮음 -> 가열
+            self._apply_relay("HEAT", True)
+        else:
+            # 목표보다 높음 -> 냉각
+            self._apply_relay("COOL", True)
+
+        return {
+            "current_temp": round(float(current_temp), 2),
+            "error": round(error, 2),
+            "pid_output": round(pid_output, 2),
+            "relay_on": self.relay_on,
+            "relay_mode": self.relay_mode,
+            "target_temp": round(self.target_temp, 2),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def run_loop(self, sensor_manager: SensorManager, handler=None):
+        """10초 주기(기본)로 센서 읽기 + PID 제어 수행"""
+        log.info("TemperatureController 루프 시작 (period=%.1fs)", self.control_period_sec)
+        while True:
+            t0 = time.time()
+            sensor_data = sensor_manager.read_once()
+            result = self.control_once(sensor_data)
+
+            if handler is not None:
+                try:
+                    handler(result)
+                except Exception as e:
+                    log.error("TemperatureController handler 오류: %s", e)
+
+            dt = time.time() - t0
+            time.sleep(max(0.0, self.control_period_sec - dt))
+
+    def cleanup(self):
+        self._apply_relay("OFF", False)
 
 # =========================================================================
 #  통합 센서 허브
@@ -1229,6 +2117,15 @@ class AstroFarmController:
                 float(cmd.get("emf_400", 300)),
                 float(cmd.get("emf_4000", 245)))
 
+        elif action == "model_update":
+            # 모델 파일 교체/재로딩은 시스템 정책에 따라 외부 워커에서 수행
+            log.info(
+                "모델 업데이트 명령 수신: version=%s url=%s checksum=%s",
+                cmd.get("model_version", ""),
+                cmd.get("model_url", ""),
+                cmd.get("checksum", "")
+            )
+
         else:
             log.warning("알 수 없는 명령: %s", action)
 
@@ -1265,6 +2162,10 @@ class AstroFarmController:
                     if exg:
                         data.exg_mean = exg.get("exg_mean", 0.0)
                         data.green_ratio = exg.get("green_ratio", 0.0)
+                        data.vari_mean = exg.get("vari_mean", 0.0)
+                        data.ngrdi_mean = exg.get("ngrdi_mean", 0.0)
+                        data.color_index = exg.get("color_index", 0.0)
+                        data.color_grade = exg.get("color_grade", "UNKNOWN")
                     self._last_cap = now
 
                 elapsed = time.time() - t0
@@ -1336,6 +2237,29 @@ class TestPhotoPeriodScheduler(unittest.TestCase):
         now_hour = 3
         self.assertFalse(6 <= now_hour < 22)
 
+class TestExGAnalyzer(unittest.TestCase):
+
+    def test_drop_warning_triggered(self):
+        warn, drop = ExGAnalyzer._calc_drop_warning(
+            today_mean_exg=0.72, prev_mean_exg=0.90, threshold_pct=10.0
+        )
+        self.assertTrue(warn)
+        self.assertGreaterEqual(drop, 10.0)
+
+    def test_drop_warning_not_triggered(self):
+        warn, drop = ExGAnalyzer._calc_drop_warning(
+            today_mean_exg=0.86, prev_mean_exg=0.90, threshold_pct=10.0
+        )
+        self.assertFalse(warn)
+        self.assertLess(drop, 10.0)
+
+    def test_drop_warning_without_previous_data(self):
+        warn, drop = ExGAnalyzer._calc_drop_warning(
+            today_mean_exg=0.50, prev_mean_exg=None, threshold_pct=10.0
+        )
+        self.assertFalse(warn)
+        self.assertEqual(drop, 0.0)
+
 class TestExGAnalysis(unittest.TestCase):
 
     def test_exg_formula(self):
@@ -1353,6 +2277,20 @@ class TestExGAnalysis(unittest.TestCase):
         b_n = b / total
         exg = 2 * g_n - r_n - b_n
         self.assertGreater(exg, 1.5)
+
+    def test_color_grade_good(self):
+        score, grade = VisionAnalyzer.classify_color_index(
+            exg_mean=0.7, green_ratio=0.8, vari_mean=0.6, ngrdi_mean=0.5
+        )
+        self.assertGreaterEqual(score, 70.0)
+        self.assertEqual(grade, "GOOD")
+
+    def test_color_grade_bad(self):
+        score, grade = VisionAnalyzer.classify_color_index(
+            exg_mean=-0.3, green_ratio=0.1, vari_mean=-0.2, ngrdi_mean=-0.3
+        )
+        self.assertLess(score, 45.0)
+        self.assertEqual(grade, "BAD")
 
 class TestPerformanceMetrics(unittest.TestCase):
 
@@ -1389,8 +2327,96 @@ class TestPerformanceMetrics(unittest.TestCase):
         self.assertIsNotNone(rate)
         self.assertGreater(rate, 0)
 
+class TestTemperatureController(unittest.TestCase):
+    """TemperatureController 동작 검증"""
+
+    def test_target_clamped_to_range(self):
+        tc = TemperatureController(target_temp=30.0)
+        self.assertEqual(tc.target_temp, 26.0)
+        tc.set_target(10.0)
+        self.assertEqual(tc.target_temp, 18.0)
+        tc.cleanup()
+
+    def test_control_heat_mode(self):
+        tc = TemperatureController(target_temp=22.0, kp=20.0, ki=0.0, kd=0.0)
+        out = tc.control_once({"temp_air": 18.0})
+        self.assertTrue(out["relay_on"])
+        self.assertEqual(out["relay_mode"], "HEAT")
+        self.assertGreater(out["pid_output"], 0)
+        tc.cleanup()
+
+    def test_control_cool_mode(self):
+        tc = TemperatureController(target_temp=22.0, kp=20.0, ki=0.0, kd=0.0)
+        out = tc.control_once({"temp_air": 26.0})
+        self.assertTrue(out["relay_on"])
+        self.assertEqual(out["relay_mode"], "COOL")
+        self.assertLess(out["pid_output"], 0)
+        tc.cleanup()
+
+    def test_control_missing_temperature(self):
+        tc = TemperatureController()
+        out = tc.control_once({})
+        self.assertIsNone(out["current_temp"])
+        self.assertIsNone(out["error"])
+        self.assertIsNone(out["pid_output"])
+        self.assertFalse(out["relay_on"])
+        tc.cleanup()
+
+class TestXBeeComm(unittest.TestCase):
+    """XBeeComm 텔레메트리/명령 파서 검증"""
+
+    def test_send_telemetry_builds_required_sections(self):
+        xb = XBeeComm(one_way_delay_sec=0.0)
+        captured = {}
+
+        def _fake_send_frame(payload_obj):
+            captured.update(payload_obj)
+            return True
+
+        xb._send_frame = _fake_send_frame  # type: ignore[attr-defined]
+        ok = xb.send_telemetry(
+            sensor_data={
+                "temperature": 24.0,
+                "exg_mean": 0.52,
+                "peltier_pct": 40,
+            },
+            lstm_prediction={"mae": 0.08, "warning": False},
+        )
+        self.assertTrue(ok)
+        self.assertEqual(captured.get("msg_type"), "telemetry")
+        self.assertIn("sensor", captured)
+        self.assertIn("control_state", captured)
+        self.assertIn("lstm_prediction", captured)
+        self.assertIn("exg_result", captured)
+        self.assertEqual(captured["sensor"]["temperature"], 24.0)
+
+    def test_telecommand_branch_temperature(self):
+        xb = XBeeComm(one_way_delay_sec=0.0)
+        cmd = xb._normalize_telecommand({"command_type": "온도설정", "target_temp": 23.5})
+        self.assertEqual(cmd.get("action"), "set_temp")
+        self.assertEqual(float(cmd.get("value")), 23.5)
+
+    def test_packet_loss_detection(self):
+        xb = XBeeComm(one_way_delay_sec=0.0)
+        xb._check_rx_sequence(10)
+        xb._check_rx_sequence(13)  # 11,12 유실
+        s = xb.stats()
+        self.assertEqual(s.get("rx_lost_packets"), 2)
+
 class TestSensorSimulation(unittest.TestCase):
     """시뮬레이션 모드에서 센서 읽기 검증"""
+
+    def test_mock_sensor_manager_interface(self):
+        sm = MockSensorManager(period_sec=0.5)
+        data = sm.read_once()
+        for key in [
+            "temp_air", "humidity", "co2", "ec", "ph", "water_temp",
+            "par_450", "par_500", "par_550", "par_570", "par_600", "par_650",
+            "timestamp",
+        ]:
+            self.assertIn(key, data)
+            self.assertIsNotNone(data[key])
+        sm.close()
 
     def test_dht11_returns_values(self):
         sensor = DHT11Sensor()
