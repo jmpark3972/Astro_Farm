@@ -497,10 +497,11 @@ class WaterQuality:
 
         if HARDWARE and i2c is not None:
             self._ads = ADS.ADS1015(i2c)
-            self._ph_chan = AnalogIn(self._ads, ADS.P0)
-            self._tds_chan = AnalogIn(self._ads, ADS.P1)
-            self._co2_chan = AnalogIn(self._ads, ADS.P2)
-            self._therm_chan = AnalogIn(self._ads, ADS.P3)
+            # AnalogIn 채널: 정수 0~3 (= Pin.A0~A3). adafruit_ads1x15 최신판에는 ads1015.P0 없음.
+            self._ph_chan = AnalogIn(self._ads, 0)
+            self._tds_chan = AnalogIn(self._ads, 1)
+            self._co2_chan = AnalogIn(self._ads, 2)
+            self._therm_chan = AnalogIn(self._ads, 3)
             log.info("ADS1015 초기화 (CH0=pH, CH1=TDS, CH2=CO2, CH3=Therm)")
         else:
             log.info("[SIM] ADS1015 시뮬레이션 모드")
@@ -1440,10 +1441,10 @@ class SensorManager:
 
             try:
                 self._ads = ADS.ADS1015(self._i2c)
-                self._ec_ch = AnalogIn(self._ads, ADS.P0)
-                self._ph_ch = AnalogIn(self._ads, ADS.P1)
-                self._co2_ch = AnalogIn(self._ads, ADS.P2)
-                self._water_temp_ch = AnalogIn(self._ads, ADS.P3)
+                self._ec_ch = AnalogIn(self._ads, 0)
+                self._ph_ch = AnalogIn(self._ads, 1)
+                self._co2_ch = AnalogIn(self._ads, 2)
+                self._water_temp_ch = AnalogIn(self._ads, 3)
                 log.info(
                     "SensorManager ADS1015 채널 매핑: A0=EC, A1=pH, A2=CO2, A3=water_temp"
                 )
