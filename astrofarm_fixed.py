@@ -65,17 +65,19 @@ from unittest.mock import patch, MagicMock
 
 # 하드웨어 모듈 임포트 시도, 실패하면 시뮬레이션 모드
 HARDWARE = False
+_HARDWARE_IMPORT_ERROR: Optional[BaseException] = None
 try:
     import board
     import busio
     import adafruit_dht
-    from adafruit_ads1x15 import ADS1015, AnalogIn, ads1x15s
+    import adafruit_ads1x15.ads1015 as ADS
+    from adafruit_ads1x15.analog_in import AnalogIn
     import neopixel
     import RPi.GPIO as GPIO
     import serial
     HARDWARE = True
-except ImportError:
-    pass
+except ImportError as e:
+    _HARDWARE_IMPORT_ERROR = e
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,6 +88,12 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("AstroFarm")
+
+if not HARDWARE and _HARDWARE_IMPORT_ERROR is not None:
+    log.warning(
+        "HARDWARE=False (실장 라이브러리 Import 실패): %s — 시뮬레이션 모드",
+        _HARDWARE_IMPORT_ERROR,
+    )
 
 # =========================================================================
 #  데이터 클래스
@@ -488,11 +496,11 @@ class WaterQuality:
         self._therm_chan = None
 
         if HARDWARE and i2c is not None:
-            self._ads = ADS1015(i2c)
-            self._ph_chan = AnalogIn(self._ads, ads1x15.Pin.A0)
-            self._tds_chan = AnalogIn(self._ads, ads1x15.Pin.A1)
-            self._co2_chan = AnalogIn(self._ads, ads1x15.Pin.A2)
-            self._therm_chan = AnalogIn(self._ads, ads1x15.Pin.A3)
+            self._ads = ADS.ADS1015(i2c)
+            self._ph_chan = AnalogIn(self._ads, ADS.P0)
+            self._tds_chan = AnalogIn(self._ads, ADS.P1)
+            self._co2_chan = AnalogIn(self._ads, ADS.P2)
+            self._therm_chan = AnalogIn(self._ads, ADS.P3)
             log.info("ADS1015 초기화 (CH0=pH, CH1=TDS, CH2=CO2, CH3=Therm)")
         else:
             log.info("[SIM] ADS1015 시뮬레이션 모드")

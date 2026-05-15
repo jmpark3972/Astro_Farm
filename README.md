@@ -17,7 +17,7 @@
 - `infer_tflite_pi.py`
   - Pi Zero용 TFLite 추론
 - `main.py`
-  - 통합 실행 루프(5초 주기)
+  - 통합 실행 루프(기본 **3초** 주기, `--loop-sec` 로 변경)
 
 ## 실행 순서 (main.py)
 
@@ -57,6 +57,16 @@ python main.py --uart-port /dev/ttyS0 --baudrate 38400 --target-temp 22
 
 ```bash
 python astrofarm_fixed.py --mode test
+```
+
+### HARDWARE=False 로 나올 때 (통신/Sensor 모두 시뮬)
+
+- `astrofarm_fixed.py` 상단에서 `board`, `busio`, `adafruit_dht`, `adafruit_ads1x15`, `neopixel`, `RPi.GPIO`, `serial` 중 하나라도 import 되지 않으면 **항상 시뮬레이션**입니다.
+- `main.py` 실행 시 로그에 `Python=... HARDWARE=False` 가 나오면 XBee도 실제 UART를 열지 않습니다.
+- 같은 보드에서 확인:
+
+```bash
+python3 -c "import astrofarm_fixed as a; print(a.HARDWARE, a._HARDWARE_IMPORT_ERROR)"
 ```
 
 ## LSTM 학습 데이터

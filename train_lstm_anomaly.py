@@ -153,8 +153,10 @@ def rows_to_feature_matrix(rows: List[Dict]) -> np.ndarray:
     if data.size == 0:
         return data
 
-    # 결측치 보간: 각 feature의 중앙값으로 대체
-    med = np.nanmedian(data, axis=0)
+    # 결측치 보간: 각 feature의 중앙값으로 대체 (컬럼 전체 NaN이면 0)
+    with np.errstate(all="ignore"):
+        med = np.nanmedian(data, axis=0)
+    med = np.where(np.isnan(med), 0.0, med)
     nan_idx = np.isnan(data)
     data[nan_idx] = np.take(med, np.where(nan_idx)[1])
     return data
@@ -212,6 +214,15 @@ def main():
     data_path = resolve_training_data_path(args.data)
     print(f"[train_lstm_anomaly] 데이터: {data_path}")
     rows = load_rows(data_path)
+    n_rows = len(rows)
+    need = args.window + 1
+    if n_rows < need:
+        raise SystemExit(
+            f"학습 데이터 행 수 부족: 현재 {n_rows}행, 최소 {need}행 필요 (--window={args.window}).\n"
+            f"  • main.py 를 더 오래 실행해 CSV를 쌓거나\n"
+            f"  • 테스트용으로 --window {max(1, n_rows - 1)} 로 줄여 보세요."
+        )
+
     data = rows_to_feature_matrix(rows)
     x_raw, y_raw = make_sliding_windows(data, window=args.window)
 

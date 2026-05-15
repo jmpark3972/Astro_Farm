@@ -5,7 +5,7 @@ AstroFarm 통합 실행 엔트리포인트
   SensorManager -> TemperatureController -> LSTMInference -> ExGAnalyzer -> XBeeComm
 
 특징:
-  - 5초 주기 메인 루프
+  - 메인 루프 주기 기본 3초 (--loop-sec 으로 변경)
   - 모듈 단위 장애 격리(실패 모듈만 스킵, 루프 지속)
   - 날짜별 CSV 로컬 저장
   - systemd 운용을 위한 SIGTERM/SIGINT 핸들링
@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from datetime import datetime
 from threading import Event
@@ -26,6 +27,7 @@ from typing import Any, Dict, Optional
 
 from astrofarm_fixed import (
     ExGAnalyzer,
+    HARDWARE,
     SensorManager,
     TemperatureController,
     XBeeComm,
@@ -128,14 +130,14 @@ class DailyCSVLogger:
 
 
 class AstroFarmMain:
-    LOOP_SEC = 5.0
 
     def __init__(self, args):
         self.args = args
+        self.loop_sec = max(0.5, float(args.loop_sec))
         self.stop_event = Event()
         self.last_exg_mean = 0.0
 
-        self.sensor_mgr = SensorManager(period_sec=5.0)
+        self.sensor_mgr = SensorManager(period_sec=min(5.0, self.loop_sec))
         self.temp_ctrl = TemperatureController(
             kp=args.kp,
             ki=args.ki,
@@ -156,6 +158,12 @@ class AstroFarmMain:
         )
         self.csv_logger = DailyCSVLogger(log_dir=args.log_dir)
 
+        log.info(
+            "실행 환경: Python=%s HARDWARE=%s (False면 UART/I2C 등 실장 통신 비활성)",
+            sys.executable,
+            HARDWARE,
+        )
+
     def _handle_signal(self, signum, _frame):
         log.info("종료 시그널 수신: %s", signum)
         self.stop_event.set()
@@ -174,7 +182,7 @@ class AstroFarmMain:
         return out
 
     def run(self):
-        log.info("AstroFarmMain 시작 (loop=%gs)", self.LOOP_SEC)
+        log.info("AstroFarmMain 시작 (loop=%gs)", self.loop_sec)
         while not self.stop_event.is_set():
             t0 = time.time()
             timestamp = datetime.now().isoformat()
@@ -280,7 +288,7 @@ class AstroFarmMain:
                 log.error("CSV 로깅 실패: %s", e)
 
             elapsed = time.time() - t0
-            sleep_sec = max(0.0, self.LOOP_SEC - elapsed)
+            sleep_sec = max(0.0, self.loop_sec - elapsed)
             self.stop_event.wait(timeout=sleep_sec)
 
         self.cleanup()
@@ -319,6 +327,12 @@ def parse_args():
     parser.add_argument("--meta", type=str, default="models/lstm_meta.json")
     parser.add_argument("--capture-dir", type=str, default="captures")
     parser.add_argument("--log-dir", type=str, default="logs")
+    parser.add_argument(
+        "--loop-sec",
+        type=float,
+        default=3.0,
+        help="메인 루프 주기(초): 센서·LSTM·ExG·XBee 호출 간격 (DHT11은 약 2초 이상 권장)",
+    )
     return parser.parse_args()
 
 
