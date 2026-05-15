@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +42,21 @@ except Exception:
 FEATURE_NAMES = ["temperature", "humidity", "co2", "ec", "ph", "par", "exg"]
 
 
+def _tflite_install_hint() -> str:
+    """pip 에 wheel 이 없을 때(특히 Py 3.13 + aarch64) 안내."""
+    parts = [
+        "pip install tflite-runtime",
+        "또는 pip install tensorflow(tf.lite).",
+    ]
+    if sys.version_info >= (3, 13):
+        parts.append(
+            "Raspberry Pi 에서 Python 3.13 은 tflite-runtime 공식 wheel 이 없을 수 있습니다. "
+            "apt 로 python3.11·python3.11-venv 설치 후 python3.11 -m venv 로 새 환경을 만들고 "
+            "그 안에서 pip install tflite-runtime 하세요."
+        )
+    return " ".join(parts)
+
+
 def _safe_float(v, default=np.nan) -> float:
     try:
         if v is None:
@@ -69,8 +85,7 @@ class TFLiteAnomalyDetector:
     def __init__(self, model_path: str, scaler_path: str, meta_path: str):
         if Interpreter is None:
             raise RuntimeError(
-                "TFLite interpreter backend not available. "
-                "Install tflite-runtime or a TensorFlow build with tf.lite."
+                "TFLite interpreter backend not available. " + _tflite_install_hint()
             )
 
         scaler = np.load(scaler_path)
