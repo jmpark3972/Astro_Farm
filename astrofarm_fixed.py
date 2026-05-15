@@ -13,7 +13,7 @@ Raspberry Pi Zero 2W OBC
                   CH1 -> SEN0244 TDS 센서
                   CH2 -> RX-9 Simple CO2 EMF 출력
                   CH3 -> RX-9 Simple Thermistor (NTC)
-  XBee         : 920MHz 통신 모듈          (UART, TX=GPIO14, RX=GPIO15)
+  XBee         : 920MHz 통신 모듈          (UART 38400, TX=GPIO14, RX=GPIO15)
   Pi Camera V2 : 8MP 식물 촬영             (CSI-2, picamera2)
   Peltier      : 온도 제어                 (GPIO 17, PWM)
   WS2812B      : NeoPixel RGB LED          (GPIO 18, 데이터)
@@ -800,7 +800,7 @@ class ActuatorHub:
 class XBeeComm:
 
     HEADER = b"\xAF\xAF"
-    BAUD = 9600
+    BAUD = 38400
     ONE_WAY_DELAY_SEC = 1.28
 
     def __init__(self, port: str = "/dev/ttyS0", baudrate: int = BAUD,

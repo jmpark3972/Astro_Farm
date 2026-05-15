@@ -47,7 +47,7 @@ python main.py
 주요 옵션 예시:
 
 ```bash
-python main.py --uart-port /dev/ttyS0 --baudrate 9600 --target-temp 22
+python main.py --uart-port /dev/ttyS0 --baudrate 38400 --target-temp 22
 ```
 
 ## 테스트/시뮬레이션

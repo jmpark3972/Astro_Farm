@@ -309,7 +309,7 @@ class AstroFarmMain:
 def parse_args():
     parser = argparse.ArgumentParser(description="AstroFarm 통합 메인 루프")
     parser.add_argument("--uart-port", type=str, default="/dev/ttyS0")
-    parser.add_argument("--baudrate", type=int, default=9600)
+    parser.add_argument("--baudrate", type=int, default=38400)
     parser.add_argument("--target-temp", type=float, default=22.0)
     parser.add_argument("--kp", type=float, default=2.0)
     parser.add_argument("--ki", type=float, default=0.1)
