@@ -16,13 +16,26 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-try:
-    from tflite_runtime.interpreter import Interpreter
-except ImportError:
-    # 개발 PC fallback
-    import tensorflow as tf
+Interpreter = None
+INTERPRETER_BACKEND = "none"
 
-    Interpreter = tf.lite.Interpreter
+try:
+    from tflite_runtime.interpreter import Interpreter as _TFLiteInterpreter
+
+    Interpreter = _TFLiteInterpreter
+    INTERPRETER_BACKEND = "tflite_runtime"
+except Exception:
+    try:
+        # 개발 PC fallback
+        import tensorflow as tf
+
+        _lite = getattr(tf, "lite", None)
+        if _lite is not None and hasattr(_lite, "Interpreter"):
+            Interpreter = _lite.Interpreter
+            INTERPRETER_BACKEND = "tensorflow.lite"
+    except Exception:
+        Interpreter = None
+        INTERPRETER_BACKEND = "none"
 
 
 FEATURE_NAMES = ["temperature", "humidity", "co2", "ec", "ph", "par", "exg"]
@@ -54,6 +67,12 @@ def extract_feature_vector(row: Dict[str, Any]) -> np.ndarray:
 
 class TFLiteAnomalyDetector:
     def __init__(self, model_path: str, scaler_path: str, meta_path: str):
+        if Interpreter is None:
+            raise RuntimeError(
+                "TFLite interpreter backend not available. "
+                "Install tflite-runtime or a TensorFlow build with tf.lite."
+            )
+
         scaler = np.load(scaler_path)
         self.mean = scaler["mean"].astype(np.float32)
         self.std = scaler["std"].astype(np.float32)
