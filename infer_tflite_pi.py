@@ -50,9 +50,10 @@ def _tflite_install_hint() -> str:
     ]
     if sys.version_info >= (3, 13):
         parts.append(
-            "Raspberry Pi 에서 Python 3.13 은 tflite-runtime 공식 wheel 이 없을 수 있습니다. "
-            "apt 로 python3.11·python3.11-venv 설치 후 python3.11 -m venv 로 새 환경을 만들고 "
-            "그 안에서 pip install tflite-runtime 하세요."
+            "Python 3.13 + aarch64 는 tflite-runtime wheel 이 제공되지 않는 경우가 많습니다. "
+            "Debian Trixie 등에서는 apt 에 python3.11 패키지가 없을 수 있습니다 → "
+            "Miniforge3(aarch64) 로 conda 환경에 python=3.11 을 만들고 pip install tflite-runtime, "
+            "또는 python.org 에서 CPython 3.12 소스 빌드 후 전용 venv 를 쓰세요."
         )
     return " ".join(parts)
 
