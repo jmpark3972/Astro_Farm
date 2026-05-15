@@ -1099,6 +1099,17 @@ class XBeeComm:
 #  영상 분석 (Pi Camera V2 + ExG)
 # =========================================================================
 
+
+def _picamera2_camera_infos():
+    """libcamera 가 노출하는 카메라 목록. 비어 있으면 CSI 미연결/비활성 가능성이 큼."""
+    try:
+        from picamera2 import Picamera2
+
+        return list(Picamera2.global_camera_info())
+    except Exception:
+        return []
+
+
 class VisionAnalyzer:
     """RGB 기반 식생지수(ExG/VARI/NGRDI) 계산 및 등급 판정"""
 
@@ -1152,7 +1163,15 @@ class VisionAnalyzer:
         if HARDWARE:
             try:
                 from picamera2 import Picamera2
-                cam = Picamera2()
+
+                infos = _picamera2_camera_infos()
+                if not infos:
+                    log.error(
+                        "VisionAnalyzer: libcamera 에 CSI 카메라가 없습니다 "
+                        "(리본 케이블, 카메라 활성화·`/boot/firmware/config.txt`, libcamera 지원 모델 확인)"
+                    )
+                    return ""
+                cam = Picamera2(0)
                 cam.configure(cam.create_still_configuration(
                     main={"size": (1920, 1080)}))
                 cam.start()
@@ -1249,7 +1268,15 @@ class ExGAnalyzer:
         if HARDWARE:
             try:
                 from picamera2 import Picamera2
-                cam = Picamera2()
+
+                infos = _picamera2_camera_infos()
+                if not infos:
+                    log.error(
+                        "ExGAnalyzer: libcamera 에 CSI 카메라가 없습니다 "
+                        "(리본 케이블, 카메라 활성화, `rpicam-hello --list-cameras` 로 확인)"
+                    )
+                    return ""
+                cam = Picamera2(0)
                 cam.configure(cam.create_still_configuration(main={"size": (1920, 1080)}))
                 cam.start()
                 time.sleep(1.5)
