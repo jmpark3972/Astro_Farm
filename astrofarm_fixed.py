@@ -611,11 +611,18 @@ class MG92BServo:
 
     영양액 공급 시퀀스 (5초 간격):
       0도 -> 90도 (개방) -> 유지 0.5초 -> 90도 -> 0도 (폐쇄)
+
+    운용 기준 pulse(us):
+      CLOSE = 600us
+      OPEN  = 1500us
+    (현재 내부 구현은 angle 기반이며, pulse 입력은 변환 헬퍼 제공)
     """
 
     PIN_SERVO = 23
     PWM_FREQ = 50           # 서보 표준 주파수 50Hz (주기 20ms)
     MOVE_WAIT = 0.3         # 90도 회전 대기 시간 (0.13s/60 * 1.5 마진)
+    SERVO_CLOSE_US = 600
+    SERVO_OPEN_US = 1500
 
     def __init__(self):
         self._pwm = None
@@ -643,6 +650,20 @@ class MG92BServo:
         """
         angle = max(0, min(180, angle))
         return (angle / 18.0) + 2.5
+
+    @staticmethod
+    def _pulse_us_to_angle(pulse_us: int) -> int:
+        """
+        pulse width(us) -> angle 변환
+        500us=0도, 2500us=180도 기준 선형 매핑
+        """
+        pulse = max(500, min(2500, int(pulse_us)))
+        angle = int(round((pulse - 500) * 180.0 / 2000.0))
+        return max(0, min(180, angle))
+
+    def set_pulse_us(self, pulse_us: int):
+        """외부 pulse 기준(예: 600/1500)으로 서보 제어"""
+        self.set_angle(self._pulse_us_to_angle(pulse_us))
 
     def set_angle(self, angle: int):
         """지정 각도로 서보 회전"""
