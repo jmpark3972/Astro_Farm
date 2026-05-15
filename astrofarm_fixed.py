@@ -1449,6 +1449,11 @@ class SensorManager:
                 )
             except Exception as e:
                 log.error("SensorManager ADS1015 초기화 실패: %s", e)
+                self._ads = None
+                self._ec_ch = None
+                self._ph_ch = None
+                self._co2_ch = None
+                self._water_temp_ch = None
         else:
             self._spectral = AS7262Sensor(None)
             log.info("[SIM] SensorManager 시뮬레이션 모드")
@@ -1491,6 +1496,10 @@ class SensorManager:
             out["ph"] = round(random.uniform(5.7, 6.8), 2)
             out["co2"] = int(random.uniform(450, 1300))
             out["water_temp"] = round(random.uniform(20.0, 27.0), 1)
+            return out
+
+        if self._ads is None or self._ec_ch is None:
+            log.warning("SensorManager ADS1015 없음: EC/pH/CO2/water_temp 건너뜀")
             return out
 
         # A0 -> SEN0244(EC)
@@ -1551,6 +1560,27 @@ class SensorManager:
         except Exception as e:
             log.error("SensorManager AS7262 읽기 예외: %s", e)
             return out
+
+    def probe_dht11(self) -> Dict[str, Any]:
+        """GPIO4 DHT11 단독 읽기 (배선·라이브러리 점검용)."""
+        out = dict(self._read_dht11())
+        out["_probe"] = "DHT11"
+        out["_hardware"] = HARDWARE
+        return out
+
+    def probe_as7262(self) -> Dict[str, Any]:
+        """AS7262(I2C 0x49) 단독 읽기."""
+        out = dict(self._read_as7262_bundle())
+        out["_probe"] = "AS7262"
+        out["_hardware"] = HARDWARE
+        return out
+
+    def probe_ads1015(self) -> Dict[str, Any]:
+        """ADS1015(I2C 0x48) A0~A3 단독 읽기."""
+        out = dict(self._read_ads1015_bundle())
+        out["_probe"] = "ADS1015"
+        out["_hardware"] = HARDWARE
+        return out
 
     def read_once(self) -> Dict[str, Any]:
         """
